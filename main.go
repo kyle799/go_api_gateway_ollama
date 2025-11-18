@@ -7,16 +7,19 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Job struct {
-	w    http.ResponseWriter
-	r    *http.Request
-	id   string
-	done chan struct{}
+	w          http.ResponseWriter
+	r          *http.Request
+	id         string
+	enqueuedAt time.Time
+	done       chan struct{}
 }
+const StatusClientClosedRequest = 499
 
 func main() {
 	backendsEnv := os.Getenv("GATEWAY_BACKENDS")
@@ -36,46 +39,63 @@ func main() {
 
 	queueSize := 100
 	if qs := os.Getenv("GATEWAY_QUEUE_SIZE"); qs != "" {
-		// optional: parse int here if you want dynamic queue size
+		if n, err := strconv.Atoi(qs); err == nil && n > 0 {
+			queueSize = n
+		}
 	}
 
-	log.Printf("Starting gateway with %d backends, queue size %d", len(backendURLs), queueSize)
+	maxQueueWait := 0 * time.Second
+	if s := os.Getenv("GATEWAY_MAX_QUEUE_WAIT_SECONDS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			maxQueueWait = time.Duration(n) * time.Second
+		}
+	}
+
+	log.Printf("Starting gateway with %d backends, queue size %d, maxQueueWait=%s",
+		len(backendURLs), queueSize, maxQueueWait)
 
 	jobCh := make(chan *Job, queueSize)
 
-	// One worker per backend → max 1 concurrent job per backend
+	// Start one worker per backend → max 1 concurrent job per backend
 	for i, be := range backendURLs {
-		go worker(i, be, jobCh)
+		go worker(i, be, jobCh, maxQueueWait)
 	}
 
 	mux := http.NewServeMux()
 
-	// Main Ollama-compatible API entry point
+	// Main Ollama-compatible API handler
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		jobID := time.Now().Format("20060102-150405.000000") + "-" + randomSuffix(6)
 		log.Printf("[job %s] received %s %s from %s", jobID, r.Method, r.URL.Path, r.RemoteAddr)
 
-		if r.Method != http.MethodPost && r.Method != http.MethodGet && r.Method != http.MethodOptions {
+		switch r.Method {
+		case http.MethodPost, http.MethodGet, http.MethodOptions:
+			// ok
+		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		job := &Job{
-			w:    w,
-			r:    r,
-			id:   jobID,
-			done: make(chan struct{}),
+			w:          w,
+			r:          r,
+			id:         jobID,
+			enqueuedAt: time.Now(),
+			done:       make(chan struct{}),
 		}
 
-		// Enqueue or fail if queue is full
+		// Try to enqueue
 		select {
 		case jobCh <- job:
-			// Wait until worker is done before handler returns
+			log.Printf("[job %s] enqueued", jobID)
+			// Wait until worker finishes (or marks it cancelled)
 			<-job.done
-			log.Printf("[job %s] finished", jobID)
+			log.Printf("[job %s] handler finished", jobID)
+
 		case <-r.Context().Done():
-			log.Printf("[job %s] client cancelled before queue", jobID)
-			http.Error(w, "client cancelled", http.StatusRequestTimeout)
+			log.Printf("[job %s] client cancelled before enqueue: %v", jobID, r.Context().Err())
+			http.Error(w, "client cancelled", StatusClientClosedRequest)
+
 		default:
 			log.Printf("[job %s] queue full, rejecting", jobID)
 			http.Error(w, "server busy, try again later", http.StatusServiceUnavailable)
@@ -102,9 +122,9 @@ func main() {
 	}
 }
 
-func worker(idx int, backend string, jobs <-chan *Job) {
+func worker(idx int, backend string, jobs <-chan *Job, maxQueueWait time.Duration) {
 	client := &http.Client{
-		Timeout: 0, // streaming; no fixed timeout
+		Timeout: 0,
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
@@ -123,14 +143,36 @@ func worker(idx int, backend string, jobs <-chan *Job) {
 
 	for job := range jobs {
 		start := time.Now()
-		log.Printf("[job %s][worker %d] dispatching to %s %s", job.id, idx, backend, job.r.URL.Path)
+		waitTime := start.Sub(job.enqueuedAt)
+		log.Printf("[job %s][worker %d] dequeued after %s", job.id, idx, waitTime)
 
-		if err := handleJob(client, backend, job); err != nil {
-			log.Printf("[job %s][worker %d] error: %v", job.id, idx, err)
-		} else {
-			log.Printf("[job %s][worker %d] completed in %s", job.id, idx, time.Since(start))
+		// If the client already cancelled while in queue, skip
+		select {
+		case <-job.r.Context().Done():
+			log.Printf("[job %s][worker %d] client cancelled while queued: %v", job.id, idx, job.r.Context().Err())
+			// Best-effort error; client is gone anyway
+			safeError(job.w, "client cancelled", StatusClientClosedRequest)
+			close(job.done)
+			continue
+		default:
 		}
 
+		// Optional: enforce max queue wait
+		if maxQueueWait > 0 && waitTime > maxQueueWait {
+			log.Printf("[job %s][worker %d] exceeded max queue wait (%s > %s), rejecting",
+				job.id, idx, waitTime, maxQueueWait)
+			safeError(job.w, "server busy, try again later", http.StatusServiceUnavailable)
+			close(job.done)
+			continue
+		}
+
+		err := handleJob(client, backend, job)
+		if err != nil {
+			log.Printf("[job %s][worker %d] error: %v", job.id, idx, err)
+		} else {
+			log.Printf("[job %s][worker %d] completed in %s (incl. wait %s)",
+				job.id, idx, time.Since(start), waitTime)
+		}
 		close(job.done)
 	}
 }
@@ -139,23 +181,18 @@ func handleJob(client *http.Client, backend string, job *Job) error {
 	ctx := job.r.Context()
 	backendURL, _ := url.Parse(backend)
 
-	// Build target URL: backend base + original path + query
-	target := *backendURL // copy
+	target := *backendURL
 	target.Path = singleJoin(backendURL.Path, job.r.URL.Path)
 	target.RawQuery = job.r.URL.RawQuery
 
-	var body io.Reader
-	if job.r.Method == http.MethodPost {
-		body = job.r.Body
-	}
-
-	req, err := http.NewRequestWithContext(ctx, job.r.Method, target.String(), body)
+	// New upstream request with same method and body, pointed at backend
+	req, err := http.NewRequestWithContext(ctx, job.r.Method, target.String(), job.r.Body)
 	if err != nil {
-		http.Error(job.w, "failed to create upstream request", http.StatusInternalServerError)
+		safeError(job.w, "failed to create upstream request", http.StatusInternalServerError)
 		return err
 	}
 
-	// Copy headers
+	// Copy headers through
 	req.Header = job.r.Header.Clone()
 
 	log.Printf("[job %s] -> %s %s", job.id, req.Method, target.String())
@@ -164,9 +201,9 @@ func handleJob(client *http.Client, backend string, job *Job) error {
 	if err != nil {
 		select {
 		case <-ctx.Done():
-			http.Error(job.w, "client cancelled", http.StatusRequestTimeout)
+			safeError(job.w, "client cancelled", StatusClientClosedRequest)
 		default:
-			http.Error(job.w, "upstream error", http.StatusBadGateway)
+			safeError(job.w, "upstream error", http.StatusBadGateway)
 		}
 		return err
 	}
@@ -180,7 +217,7 @@ func handleJob(client *http.Client, backend string, job *Job) error {
 	}
 	job.w.WriteHeader(resp.StatusCode)
 
-	// Stream body
+	// Stream body directly
 	_, err = io.Copy(job.w, resp.Body)
 	if err != nil {
 		log.Printf("[job %s] streaming error: %v", job.id, err)
@@ -197,7 +234,6 @@ func singleJoin(basePath, subPath string) string {
 	return strings.TrimRight(basePath, "/") + "/" + strings.TrimLeft(subPath, "/")
 }
 
-// randomSuffix is just for log-friendly IDs, not cryptographic.
 func randomSuffix(n int) string {
 	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
@@ -206,5 +242,13 @@ func randomSuffix(n int) string {
 		b[i] = letters[int(now+int64(i))%len(letters)]
 	}
 	return string(b)
+}
+
+// safeError tries to send an error to the client but ignores write failures.
+func safeError(w http.ResponseWriter, msg string, code int) {
+	defer func() {
+		_ = recover()
+	}()
+	http.Error(w, msg, code)
 }
 
