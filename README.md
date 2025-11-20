@@ -1,4 +1,3 @@
-<details id="__DETAIL_0__"/>
 # go_api_gateway_ollama
 
 A lightweight Go‑based API gateway that forwards requests to one or more Ollama‑compatible back‑ends.  
