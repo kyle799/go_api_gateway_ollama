@@ -176,6 +176,16 @@ Feel free to extend the worker logic or add new endpoints.
 Pull requests are welcome.  
 Please follow the existing code style and add tests where applicable.
 
+
+---
+
+## TO-DO
+
+[] Health endpoint 
+[] Statics endpoint maybe gui as well graphs?
+[] dynamic queue sizing 
+
+
 ---
 
 ## License
